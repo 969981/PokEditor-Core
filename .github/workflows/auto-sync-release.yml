@@ -1,0 +1,143 @@
+# Sync turtleisaac/PokEditor-Core without rewriting local development branches.
+# Build in this same run because a GITHUB_TOKEN push does not trigger the normal
+# Build workflow. Release a GitHub-only snapshot once per upstream revision.
+name: Sync upstream and release JAR
+
+on:
+  schedule:
+    - cron: '19,49 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pokeditor-core-upstream-sync-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == '969981/PokEditor-Core'
+    name: Sync upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      publish: ${{ steps.sync.outputs.publish }}
+      commit: ${{ steps.sync.outputs.commit }}
+      upstream: ${{ steps.sync.outputs.upstream }}
+      tag: ${{ steps.sync.outputs.tag }}
+    steps:
+      - name: Checkout local main with full history
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Sync new commits and detect missing release
+        id: sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/turtleisaac/PokEditor-Core.git
+          git fetch --no-tags upstream main
+          upstream_sha=$(git rev-parse upstream/main)
+          if ! git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            # No force push: keep custom workflows, local commits and branches.
+            # Merge conflicts deliberately fail instead of discarding changes.
+            git merge --no-ff -m "chore(sync): upstream $upstream_sha" upstream/main
+            git push origin HEAD:main
+            echo "Synced upstream $upstream_sha"
+          else
+            echo "Already up to date with upstream $upstream_sha"
+          fi
+
+          tag="sync-${upstream_sha:0:12}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $tag already exists: nothing to publish."
+            echo 'publish=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # This also retries a failed build or missing release at the next interval.
+          {
+            echo 'publish=true'
+            echo "commit=$(git rev-parse HEAD)"
+            echo "upstream=$upstream_sha"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+
+  package:
+    if: needs.sync.outputs.publish == 'true'
+    needs: sync
+    name: Verify and package Java library
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exactly the synchronized revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.commit }}
+      - name: Set up JDK 21 and Maven cache
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Generate ANTLR sources and run Maven verification
+        run: mvn -B -ntp clean verify
+      - name: Verify source JAR and prepare release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          sources=(target/*-sources.jar)
+          if (( ${#sources[@]} == 0 )); then
+            mvn -B -ntp -DskipTests source:jar-no-fork
+          fi
+          jars=(target/PokEditor-Core-*.jar)
+          sources=(target/*-sources.jar)
+          if (( ${#jars[@]} < 2 || ${#sources[@]} != 1 )); then
+            echo "::error::Expected main and sources JAR, found: ${jars[*]:-none}"
+            exit 1
+          fi
+          mkdir -p dist
+          cp "${jars[@]}" dist/
+          cp pom.xml README.md dist/
+          (cd dist && sha256sum * > SHA256SUMS)
+          cat dist/SHA256SUMS
+      - name: Publish snapshot to this repository only
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.sync.outputs.tag }}
+          MIRROR_SHA: ${{ needs.sync.outputs.commit }}
+          UPSTREAM_SHA: ${{ needs.sync.outputs.upstream }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists: skipping duplicate."
+            exit 0
+          fi
+          cat > release-notes.md <<EOF
+          Automated PokEditor-Core library build from [turtleisaac/PokEditor-Core](https://github.com/turtleisaac/PokEditor-Core).
+
+          - Upstream revision: $UPSTREAM_SHA
+          - Mirror build revision: $MIRROR_SHA
+          - JDK: 21; Maven: clean verify
+          - Includes library JAR, Java source JAR, POM, README and SHA256 checksums
+          - CI: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+
+          Library only; not an executable Pokémon editor. Tests requiring retail ROM files
+          are skipped when those files are not present in CI.
+          EOF
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$MIRROR_SHA" \
+            --title "PokEditor-Core upstream ${UPSTREAM_SHA:0:12}" \
+            --notes-file release-notes.md \
+            --prerelease
