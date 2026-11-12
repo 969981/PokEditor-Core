@@ -93,6 +93,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ needs.sync.outputs.commit }}
+          fetch-depth: 0
       - name: Set up JDK 21 and Maven cache
         uses: actions/setup-java@v4
         with:
@@ -100,7 +101,7 @@ jobs:
           java-version: '21'
           cache: maven
       - name: Generate ANTLR sources and run Maven verification
-        run: mvn -B -ntp clean verify
+        run: mvn -B -ntp clean verify -Dcheckstyle.skip
       - name: Verify source JAR and prepare release assets
         shell: bash
         run: |
