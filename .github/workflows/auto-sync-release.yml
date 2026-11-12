@@ -49,7 +49,14 @@ jobs:
             git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
             # No force push: keep custom workflows, local commits and branches.
             # Merge conflicts deliberately fail instead of discarding changes.
-            git merge --no-ff -m "chore(sync): upstream $upstream_sha" upstream/main
+            git merge --squash --no-commit upstream/main
+            while IFS= read -r -d '' added; do
+              git rm -f -- "$added"
+            done < <(git diff --cached --name-only -z --diff-filter=A -- .github/workflows/)
+            git restore --source=HEAD --staged --worktree -- .github/workflows/
+            if ! git diff --cached --quiet; then
+              git commit -m "chore(sync): upstream source $upstream_sha (keep local workflows)"
+            fi
             git push origin HEAD:main
             echo "Synced upstream $upstream_sha"
           else
