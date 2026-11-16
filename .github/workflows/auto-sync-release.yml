@@ -53,7 +53,45 @@ jobs:
             git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
             # No force push: keep custom workflows, local commits and branches.
             # Merge conflicts deliberately fail instead of discarding changes.
-            git merge --squash --no-commit upstream/main
+            if ! git merge --no-ff --no-commit "$upstream_sha"; then
+            # These two conflicts were reviewed against the upstream Maven test/coverage update.
+            # Our pom.xml already includes the upstream Surefire/JaCoCo/PIT plugins while
+            # retaining the fork's Spotless and Checkstyle configuration. Do not hide
+            # future upstream edits: require the exact reviewed upstream blobs.
+            mapfile -d '' -t conflicts < <(git diff --name-only -z --diff-filter=U)
+            if (( ${#conflicts[@]} == 0 )); then
+              echo "::error::Merge failed without listed file conflicts."
+              exit 1
+            fi
+            for file in "${conflicts[@]}"; do
+              case "$file" in
+                pom.xml)
+                  if [[ "$(git rev-parse "$upstream_sha:pom.xml")" != "45a7696d4ee08dbd13c6a68c675ec42e08dfa090" ]]; then
+                    echo "::error::Upstream pom.xml changed; review before reconciling."
+                    exit 1
+                  fi
+                  git checkout --ours -- "$file"
+                  git add -- "$file"
+                  ;;
+                .cursor/rules/java-style.mdc)
+                  if [[ "$(git rev-parse "$upstream_sha:.cursor/rules/java-style.mdc")" != "2372a2799d42efa9e505608f4d81b0822548fd20" ]]; then
+                    echo "::error::Upstream style guide changed; review before reconciling."
+                    exit 1
+                  fi
+                  git checkout --ours -- "$file"
+                  git add -- "$file"
+                  ;;
+                .github/workflows/*)
+                  git checkout --ours -- "$file"
+                  git add -- "$file"
+                  ;;
+                *)
+                  echo "::error::Unreviewed upstream source conflict: $file"
+                  exit 1
+                  ;;
+              esac
+            done
+          fi
             while IFS= read -r -d '' added; do
               git rm -f -- "$added"
             done < <(git diff --cached --name-only -z --diff-filter=A -- .github/workflows/)
